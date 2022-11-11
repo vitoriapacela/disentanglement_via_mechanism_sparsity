@@ -44,8 +44,10 @@ from disentanglement_via_mechanism_sparsity.model.latent_models_vae import FCGau
 
 
 manifold = "nn"
-transition_model = "action_sparsity_trivial"
+transition_model = "simplest_discrete"
 
 datasets = get_ToyManifoldDatasets(manifold, transition_model, split=(0.8, 0.1, 0.1),
-                                       z_dim=10, x_dim=20, num_samples=int(1e6),
+                                       z_dim=2, x_dim=6, num_samples=100,
                                        no_norm=True, discrete=True)
+
+datasets[-3].__getitem__(5)

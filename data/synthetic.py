@@ -1,20 +1,21 @@
-from imp import PY_FROZEN
-import os
-from os.path import join
-import gzip
-import shutil
-from pathlib import Path
+# from imp import PY_FROZEN
+# import os
+# from os.path import join
+# import gzip
+# import shutil
+# from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from scipy.linalg import block_diag
+from scipy.special import softmax
 
 from torch.distributions import Categorical
 
 
-def get_decoder(manifold, x_dim, z_dim, rng_data_gen):
+def get_decoder(manifold, x_dim, z_dim, rng_data_gen, dtype=torch.double):
     """Mixing function.
 
     Args:
@@ -40,28 +41,28 @@ def get_decoder(manifold, x_dim, z_dim, rng_data_gen):
         W1 = np.linalg.qr(W1.T)[0].T
         # print("distance to identity:", np.max(np.abs(np.matmul(W1, W1.T) - np.eye(self.z_dim))))
         W1 *= np.sqrt(2 / (1 + neg_slope ** 2)) * np.sqrt(2. / (z_dim + h_dim))
-        W1 = torch.Tensor(W1).to(device)
+        W1 = torch.tensor(W1, dtype=dtype).to(device)
         W1.requires_grad = False
 
         W2 = rng_data_gen.normal(size=(h_dim, h_dim))
         W2 = np.linalg.qr(W2.T)[0].T
         # print("distance to identity:", np.max(np.abs(np.matmul(W2, W2.T) - np.eye(h_dim))))
         W2 *= np.sqrt(2 / (1 + neg_slope ** 2)) * np.sqrt(2. / (2 * h_dim))
-        W2 = torch.Tensor(W2).to(device)
+        W2 = torch.tensor(W2, dtype=dtype).to(device)
         W2.requires_grad = False
 
         W3 = rng_data_gen.normal(size=(h_dim, h_dim))
         W3 = np.linalg.qr(W3.T)[0].T
         # print("distance to identity:", np.max(np.abs(np.matmul(W3, W3.T) - np.eye(h_dim))))
         W3 *= np.sqrt(2 / (1 + neg_slope ** 2)) * np.sqrt(2. / (2 * h_dim))
-        W3 = torch.Tensor(W3).to(device)
+        W3 = torch.tensor(W3, dtype=dtype).to(device)
         W3.requires_grad = False
 
         W4 = rng_data_gen.normal(size=(h_dim, x_dim))
         W4 = np.linalg.qr(W4.T)[0].T
         # print("distance to identity:", np.max(np.abs(np.matmul(W4, W4.T) - np.eye(h_dim))))
         W4 *= np.sqrt(2 / (1 + neg_slope ** 2)) * np.sqrt(2. / (x_dim + h_dim))
-        W4 = torch.Tensor(W4).to(device)
+        W4 = torch.tensor(W4, dtype=dtype).to(device)
         W4.requires_grad = False
 
         # note that this decoder is almost surely invertible WHEN dim <= h_dim <= x_dim
@@ -75,7 +76,7 @@ def get_decoder(manifold, x_dim, z_dim, rng_data_gen):
                 z (ndarray):
             """
             with torch.no_grad():
-                z = torch.Tensor(z).to(device)
+                z = torch.tensor(z, dtype=dtype).to(device)
                 h1 = torch.matmul(z, W1)
                 h1 = torch.maximum(neg_slope * h1, h1)  # leaky relu
                 h2 = torch.matmul(h1, W2)
@@ -129,6 +130,7 @@ class ActionToyManifoldDataset(torch.utils.data.Dataset):
                 return mu_tp1, var_tp1
 
             self.gt_gc = torch.eye(self.z_dim)
+
         elif self.transition_model == "action_sparsity_non_trivial":
             mat_range = np.repeat(np.arange(3, self.z_dim + 3)[:, None] / np.pi, self.z_dim, 1)
             gt_gc = np.concatenate([np.eye(self.z_dim), np.eye(self.z_dim)[:, 0:1]], 1)[:, 1:] + np.eye(self.z_dim)
@@ -164,6 +166,7 @@ class ActionToyManifoldDataset(torch.utils.data.Dataset):
                 return mu_tp1, var_tp1
 
             self.gt_gc = torch.Tensor(gt_gc)
+
         else:
             raise NotImplementedError(f"The transition model {self.transition_model} is not implemented.")
 
@@ -315,17 +318,17 @@ class TemporalToyManifoldDataset(torch.utils.data.Dataset):
 
 
 class DiscreteActionToyManifoldDataset(torch.utils.data.Dataset):
-    def __init__(self, manifold, transition_model, num_samples, seed, x_dim, z_dim, n_classes=5, no_norm=True, seed_data=265542):
-        """Action dataset.
+    def __init__(self, manifold, transition_model, num_samples, seed, x_dim, z_dim, n_classes=4, no_norm=True, seed_data=265542):
+        """Dataset for action sparsity and discrete variables.
 
         Args:
             manifold (str): 'nn' (only value implemented)
             transition_model (str): "action_sparsity_trivial" or "action_sparsity_non_trivial" or "action_sparsity_non_trivial_no_suff_var" or "action_sparsity_non_trivial_no_graph_crit"
             num_samples (int): 
             seed (int): seed for sampling dataset
-            x_dim (int): 
-            z_dim (int):
-            n_classes (int):
+            x_dim (int): number of observed variables
+            z_dim (int): number of latent variables
+            n_classes (int): number of classes
             no_norm (bool, optional): Defaults to False.
             seed_data (int): seed for sampling data generation process.
 
@@ -345,54 +348,98 @@ class DiscreteActionToyManifoldDataset(torch.utils.data.Dataset):
         self.n_classes = n_classes
         self.num_samples = num_samples
         self.no_norm = no_norm
+        self.k = self.n_classes - 1 # dimension of minimal sufficient statistics
+        self.a_dim = self.z_dim # number of groups
 
-        if self.transition_model == "action_sparsity_trivial":
-            def get_mean_var(c, var_fac=0.0001):
-                mu_tp1 = np.sin(c)
-                var_tp1 = var_fac * np.ones_like(mu_tp1)
-                return mu_tp1, var_tp1
+        if self.transition_model == "simplest_discrete":
 
-            self.gt_gc = torch.eye(self.z_dim)
-        elif self.transition_model == "action_sparsity_non_trivial":
-            mat_range = np.repeat(np.arange(3, self.z_dim + 3)[:, None] / np.pi, self.z_dim, 1)
-            gt_gc = np.concatenate([np.eye(self.z_dim), np.eye(self.z_dim)[:, 0:1]], 1)[:, 1:] + np.eye(self.z_dim)
-            shift = np.repeat(np.arange(0, self.z_dim)[:, None], self.z_dim, 1)
+            self.G = torch.eye(self.z_dim) # G matrix, mask of latent and actions
+            ## this only works when d_z = n_classes-1 = a !!!!!!
 
-            def get_mean_var(c, var_fac=0.0001):
-                mu_tp1 = np.sum(gt_gc * np.sin(c[:, None, :] * mat_range + shift), 2)
-                var_tp1 = var_fac * np.ones_like(mu_tp1)
-                return mu_tp1, var_tp1
+            # def p_z_given_a():
+            # this currently works
+            #     # "a" is encoded in the graph
+            #     # ones_k = np.ones(self.k)
+            #     lambda_0 = self.rng_data_gen.normal(size=(self.z_dim, self.k))
+            #     # n = self.rng_data_gen.normal(size=(self.num_samples, self.k*self.z_dim))
+            #     n = self.rng_data_gen.normal(size=(self.z_dim, self.k))
 
-            self.gt_gc = torch.Tensor(gt_gc)
+            #     lambdas = np.zeros(shape=(self.z_dim, self.a_dim, self.k))
+                
+            #     for i in range(self.G.shape[0]):
+            #         for j in range(self.G.shape[1]):
+            #             lambdas[i,j] = lambda_0[i] + np.expand_dims(self.G[i,j],-1) * n[i]
 
-        elif self.transition_model == "action_sparsity_non_trivial_no_suff_var":
-            gt_gc = np.concatenate([np.eye(self.z_dim), np.eye(self.z_dim)[:, 0:1]], 1)[:, 1:] + np.eye(self.z_dim)
-            A = self.rng_data_gen.normal(size=(self.z_dim, self.z_dim)) * gt_gc
+            #     # for l in range(self.G.shape[1]): # loop over groups
+            #     #     extended_mask = np.kron(self.G[:,l], ones_k) # this is encoding the actions
+            #     #     lambda_a = n[l] * extended_mask
+            #     #     lambdas[l] = lambda_0 + lambda_a
+            #     # lambdas_reshaped = lambdas.reshape((self.z_dim, self.z_dim, self.k))
 
-            def get_mean_var(c, var_fac=0.0001):
-                mu_tp1 = np.matmul(c, A.T)
-                var_tp1 = var_fac * np.ones_like(mu_tp1)
-                return mu_tp1, var_tp1
+            #     # append a row of ones for the probability of the last class
+            #     zeros_c = np.zeros(shape=(self.z_dim, self.z_dim, 1))
+            #     lambdas_c = np.concatenate([lambdas, zeros_c], -1) # logits
+            #     p = softmax(lambdas_c, axis=-1)
+            #     return p
 
-            self.gt_gc = torch.Tensor(gt_gc)
+            self.n_children = self.G.sum(axis=1) # number of elements in each group
 
-        elif self.transition_model == "action_sparsity_non_trivial_no_graph_crit":
-            assert self.z_dim % 2 == 0
-            mat_range = np.repeat(np.arange(3, self.z_dim + 3)[:, None] / np.pi, self.z_dim, 1)
-            gt_gc = block_diag(*[np.ones((2, 2)) for _ in range(int(self.z_dim / 2))])
-            shift = np.repeat(np.arange(0, self.z_dim)[:, None], self.z_dim, 1)
+            def p_z_given_a():
+                # "a" is encoded in the graph
+                # ones_k = np.ones(self.k)
+                lambda_0 = self.rng_data_gen.normal(size=(self.z_dim, self.k))
+                
+                lambdas = np.zeros(shape=(self.z_dim, self.a_dim, self.k))
+                
+                for i in range(self.z_dim):
+                    for g in range(self.a_dim):
+                        n_intra = int(self.n_children[g].item())
+                        n_g = self.rng_data_gen.normal(size=(self.z_dim, self.k, n_intra))
+                        for j in range(n_intra):
+                            lambdas[i,g,j] = lambda_0[i] + np.expand_dims(self.G[i,g],-1) * n_g[i,j]
 
-            def get_mean_var(c, var_fac=0.0001):
-                mu_tp1 = np.sum(gt_gc * np.sin(c[:, None, :] * mat_range + shift), 2)
-                var_tp1 = var_fac * np.ones_like(mu_tp1)
-                return mu_tp1, var_tp1
+                # for l in range(self.G.shape[1]): # loop over groups
+                #     extended_mask = np.kron(self.G[:,l], ones_k) # this is encoding the actions
+                #     lambda_a = n[l] * extended_mask
+                #     lambdas[l] = lambda_0 + lambda_a
+                # lambdas_reshaped = lambdas.reshape((self.z_dim, self.z_dim, self.k))
 
-            self.gt_gc = torch.Tensor(gt_gc)
+                # append a row of ones for the probability of the last class
+                zeros_c = np.zeros(shape=(self.z_dim, self.z_dim, 1))
+                lambdas_c = np.concatenate([lambdas, zeros_c], -1) # logits
+                p = softmax(lambdas_c, axis=-1)
+                return p
+
+
+            # def p_z_given_a():
+            #     # "a" is encoded in the graph
+            #     ones_k = np.ones(self.k)
+            #     lambda_0 = self.rng_data_gen.normal(size=self.k*self.z_dim)
+            #     # n = self.rng_data_gen.normal(size=(self.num_samples, self.k*self.z_dim))
+            #     n = self.rng_data_gen.normal(size=(self.k*self.z_dim))
+
+            #     lambdas = np.zeros((self.z_dim, self.k*self.z_dim)) # here, the first z_dim is the number of groups
+
+            #     for l in range(self.G.shape[1]): # loop over groups
+            #         extended_mask = np.kron(self.G[:,l], ones_k) # this is encoding the actions
+            #         lambda_a = n[l] * extended_mask
+            #         lambdas[l] = lambda_0 + lambda_a
+            #     lambdas_reshaped = lambdas.reshape((self.z_dim, self.z_dim, self.k))
+
+            #     # append a row of ones for the probability of the last class
+            #     zeros_c = np.zeros((self.z_dim, self.z_dim, 1))
+            #     lambdas_c = np.concatenate([lambdas_reshaped, zeros_c], -1) # logits
+            #     p = softmax(lambdas_c, axis=-1)
+            #     return p
+
         else:
             raise NotImplementedError(f"The transition model {self.transition_model} is not implemented.")
 
+        # now generate a's for i in each num_samples
+        # do this for all lambdas depending on the value of a
+
         self.decoder, self.noise_std = get_decoder(self.manifold, self.x_dim, self.z_dim, self.rng_data_gen)
-        self.get_mean_var = get_mean_var
+        self.p_z_given_a = p_z_given_a
         self.create_data()
 
     def __len__(self):
@@ -402,65 +449,94 @@ class DiscreteActionToyManifoldDataset(torch.utils.data.Dataset):
     #     mu_tp1, var_tp1 = self.get_mean_var(c)
     #     return self.rng.normal(mu_tp1, np.sqrt(var_tp1))
 
-    def sample_z_given_c_by_class(self, c, n_classes):
-        d = c.shape[0]
-        mu_tp1, var_tp1 = self.get_mean_var(c)
-        return self.rng.normal(mu_tp1, np.sqrt(var_tp1), size=(self.n_classes, d, self.z_dim))
+    # def sample_z_given_c_by_class(self, c):
+    #     d = c.shape[0]
+    #     mu_tp1, var_tp1 = self.get_mean_var(c)
+    #     return self.rng.normal(mu_tp1, np.sqrt(var_tp1), size=(self.n_classes, d, self.z_dim))
 
     def create_data(self):
         # c = self.rng_data_gen.uniform(-2, 2, size=(self.num_samples, self.z_dim)) # sample actions
         # c = self.rng_data_gen.uniform(-2, 2, size=(self.num_samples, self.n_classes, self.z_dim)) # sample actions
 
+        #### old!
         # sample actions
-        c = self.rng_data_gen.uniform(-2, 2, size=(self.num_samples, self.z_dim)) 
+        # a = self.rng_data_gen.uniform(-2, 2, size=(self.num_samples, self.z_dim)) 
 
-        # generate continuous z
-        z = self.sample_z_given_c_by_class(c, self.n_classes)
-        z = torch.Tensor(z)
-        z = z.permute(1,0,2)
+        # # generate continuous z
+        # z = self.sample_z_given_c_by_class(c)
+        # z = torch.Tensor(z)
+        # z = z.permute(1,0,2)
 
-        # discretize z
-        softmax_z = torch.nn.Softmax(dim=1)
-        self.p_z = softmax_z(z) # categorical probabilities
-        categorical_z = Categorical(self.p_z)
-        disc_z = categorical_z.sample(sample_shape=torch.Size([self.z_dim])) # categorical samples
-        disc_z = disc_z.permute(1,2,0)
-        self.disc_z = disc_z
+        # # discretize z
+        # softmax_z = torch.nn.Softmax(dim=1)
+        # self.p_z = softmax_z(z) # categorical probabilities
+        # categorical_z = Categorical(self.p_z)
+        # disc_z = categorical_z.sample(sample_shape=torch.Size([self.z_dim])) # categorical samples
+        # disc_z = disc_z.permute(1,2,0)
+        # self.disc_z = disc_z
+
+        ## new
+        # sample actions
+        # a = self.rng_data_gen.uniform(-2, 2, size=(self.num_samples, self.z_dim))
+        # a = np.random.normal(size=1) # in this case, we have only one action per group. we would need another for loop otherwise
+        
+        a = np.random.choice(self.n_classes, (self.num_samples, self.z_dim))
+
+        prob = self.p_z_given_a()
+        p_z = Categorical(torch.Tensor(prob))
+        z = p_z.sample(sample_shape=torch.Size([self.num_samples])).double()
 
         # generate observation
         x = self.decoder(z)
 
-        # normalize
-        if not self.no_norm:
-            x = (x - x.mean(0)) / x.std(0)
+        # # normalize
+        # if not self.no_norm:
+        #     x = (x - x.mean(0)) / x.std(0)
 
         # do not add noise
         # x = x + self.noise_std * self.rng.normal(0, 1, size=(self.num_samples, self.x_dim))
 
         self.x = torch.Tensor(x)
-        self.cont_z = z
-        self.c = torch.Tensor(c) # actions
+        # self.cont_z = z
+        self.a = torch.Tensor(a) # actions
 
 
-        # discrete data
-        softmax_x = torch.nn.Softmax(dim=-2)
-        self.p_x = softmax_x(self.x) # categorical probabilities
-        categorical_x = Categorical(self.p_x)
-        disc_x = categorical_x.sample(sample_shape=torch.Size([self.x_dim])) # categorical samples
-        disc_x = disc_x.permute(1,2,0)
-        self.disc_x = disc_x
+        # uncomment below for discrete data
+        ## discrete data
+        # softmax_x = torch.nn.Softmax(dim=-2)
+        # self.p_x = softmax_x(self.x) # categorical probabilities
+        # categorical_x = Categorical(self.p_x)
+        # disc_x = categorical_x.sample(sample_shape=torch.Size([self.x_dim])) # categorical samples
+        # disc_x = disc_x.permute(1,2,0)
+        # self.disc_x = disc_x
+
+        # this is still continuous data:
+        # normalize
+        # if not self.no_norm:
+        #     x = (x - x.mean(0)) / x.std(0)
+
+        # x = x + self.noise_std * self.rng.normal(0, 1, size=(self.num_samples, self.x_dim))
+
+        self.x = torch.Tensor(x)
+        self.z = z
+
+        # just return things in the right place
+        # self.disc_x = self.x
+        # self.p_x = None
+
+        # self.p_z = prob
 
     def __getitem__(self, item):
         obs = self.x[item: item + 1]  # must have a dimension for time (of size 1 since no temporal dependencies)
-        cont_c = self.c[item]
-        disc_c = torch.Tensor(np.array([0.])).long()
+        a = self.a[item]
+        # disc_a = torch.Tensor(np.array([0.])).long()
         valid = True # mask indicating that the sample should be included in the minibatch. not useful for synthetic data, but down the pipeline
         # cont_z = self.cont_z[item: item + 1]  # must have a dimension for time (of size 1 since no temporal dependencies)
-        prob_z = self.p_z[item: item + 1]
-        disc_z = self.disc_z[item: item + 1]
-        prob_x = self.p_x[item: item + 1]
-        disc_x = self.disc_x[item: item + 1]
-        return obs, cont_c, disc_c, valid, prob_z, disc_z, prob_x, disc_x
+        # prob_z = self.p_z[item: item + 1]
+        disc_z = self.z[item: item + 1]
+        # prob_x = self.p_x[item: item + 1]
+        x = self.x[item: item + 1]
+        return obs, a, valid, disc_z, x
 
 
 def get_ToyManifoldDatasets(manifold, transition_model, split=(0.7, 0.15, 0.15), z_dim=2, x_dim=10, num_samples=1e6,
